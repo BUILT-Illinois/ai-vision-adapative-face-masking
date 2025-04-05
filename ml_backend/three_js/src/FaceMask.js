@@ -3,39 +3,51 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader";
 import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
 import "./FaceMask.css";
+import * as AWS from 'aws-sdk/global';
+import mqtt from 'mqtt';
+import SigV4Utils from './sigv4-utils'; // helper file
+
+const AWS_IOT_ENDPOINT = 'aevqdnds5bghe-ats.iot.us-east-1.amazonaws.com';
+const clientId = 'eoh-processing-unit';
+const identityPoolId = 'us-east-1:d54013b4-7216-4e6c-8e2c-da0aa0877382';
+const region = 'us-east-1';
+
+AWS.config.region = region;
+AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+  IdentityPoolId: identityPoolId,
+});
 
 const { FaceLandmarker, FilesetResolver } = vision;
 
 const FaceMask = () => {
   const containerRef = useRef(null);
-  const raccoonRef = useRef(null);
-  const glassesRef = useRef(null);
-  const videoRef = useRef(null); 
+  const videoRef = useRef(null);
   const sceneRef = useRef(null);
-  const [selectedModel, setSelectedModel] = useState("raccoon");
+  const modelsRef = useRef({});
+  const mqttClientRef = useRef(null);
+  const [selectedModel, setSelectedModel] = useState("raccoon_head");
 
   useEffect(() => {
-    let renderer;
-    let scene;
-    let camera;
-    let faceLandmarker;
+    let renderer, scene, camera, faceLandmarker;
 
     // Initialize FaceLandmarker
     const initFaceLandmarker = async () => {
-      const filesetResolver = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
-      );
-      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-          delegate: "GPU",
-        },
-        outputFaceBlendshapes: true,
-        outputFacialTransformationMatrixes: true,
-        runningMode: "VIDEO",
-        numFaces: 1,
-      });
+      if (!faceLandmarker) {
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+            delegate: "GPU",
+          },
+          outputFaceBlendshapes: true,
+          outputFacialTransformationMatrixes: true,
+          runningMode: "VIDEO",
+          numFaces: 1,
+        });
+      }
+
     };
 
     // Initialize Three.js Scene
@@ -44,6 +56,9 @@ const FaceMask = () => {
         renderer = new THREE.WebGLRenderer({ alpha: true });
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.setClearColor(0x000000, 0);
+      }
+
+      if (containerRef.current && containerRef.current.childNodes.length === 0) {
         containerRef.current.appendChild(renderer.domElement);
       }
 
@@ -53,88 +68,79 @@ const FaceMask = () => {
       }
 
       if (!camera) {
-        camera = new THREE.PerspectiveCamera(80, window.innerWidth / window.innerHeight, 0.01, 100);
+        camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
         camera.position.z = 2;
       }
 
       const light = new THREE.AmbientLight(0xffffff, 1.8);
       scene.add(light);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 3);
+      directionalLight.position.set(0, 1, 1);
+      scene.add(directionalLight);
     };
 
-    // Load Models (raccoon and glasses)
+    // Load models
     const loadModels = () => {
       const loader = new GLTFLoader();
-      
-      loader.load("/models/raccoon_head.glb", (gltf) => {
-        const raccoon = gltf.scene;
-        raccoon.scale.set(0.15, 0.15, 0.15); // Adjust scale to fit on face
-        raccoon.visible = false;
-        sceneRef.current.add(raccoon);
-        raccoonRef.current = raccoon;
-      });
 
-      loader.load("/models/glasses.glb", (gltf) => {
-        const glasses = gltf.scene;
-        glasses.scale.set(0.3, 0.3, 0.3); // Adjust scale to fit on face
-        glasses.visible = false;
-        sceneRef.current.add(glasses);
-        glassesRef.current = glasses;
+      const models = [
+        { name: "raccoon_head", scale: [48, 48, 48], path: "/models/raccoon_head.glb" },
+        { name: "glasses", scale: [80, 80, 80], path: "/models/glasses.glb" },
+        { name: "cat", scale: [15, 15, 15], path: "/models/cat.glb" },
+        { name: "dog", scale: [14, 14, 14], path: "/models/dog.glb" },
+        { name: "lion", scale: [15, 15, 15], path: "/models/lion.glb" },
+        { name: "cow", scale: [15, 15, 15], path: "/models/cow.glb" },
+        { name: "horse", scale: [25, 25, 25], path: "/models/horse.glb" },
+        { name: "unicorn", scale: [15, 15, 15], path: "/models/unicorn.glb" },
+        { name: "freddy", scale: [25, 25, 25], path: "/models/freddy.glb" },
+        { name: "nerd", scale: [25, 25, 25], path: "/models/nerd.glb" }
+      ];
+
+      models.forEach((model) => {
+        loader.load(
+          model.path,
+          (gltf) => {
+            const gltfModel = gltf.scene;
+            gltfModel.scale.set(...model.scale);
+            gltfModel.visible = false;
+            sceneRef.current.add(gltfModel);
+            modelsRef.current[model.name] = gltfModel;
+          },
+          undefined,
+          (error) => console.error(`${model.name} model load error:`, error)
+        );
       });
     };
 
     const applyMatrixToModels = (matrixData) => {
       if (!matrixData || matrixData.length === 0) return;
-    
+
       const threeMatrix = new THREE.Matrix4();
       threeMatrix.fromArray(matrixData);
       const position = new THREE.Vector3();
       const quaternion = new THREE.Quaternion();
       const scale = new THREE.Vector3();
       threeMatrix.decompose(position, quaternion, scale);
-      // position.multiplyScalar(0.20);
-      // scale.set(10,10,10);
-    
-      console.log(position)
-      console.log(quaternion)
-      // Fix: Scale down translation from mm to meters
-      // position.multiplyScalar(0.20); // Adjust this factor if needed
-    
-      // Optionally offset the Y and Z if needed
-      position.y += 0.05;
-      position.z += 0.02;
 
-      // position.x *= -1;
-      // quaternion.x *= -1;
-      // quaternion.y *= -1;
-      // quaternion.z *= -1;
-      // position.multiplyScalar(1.5);
-
-    
-      if (raccoonRef.current) {
-        raccoonRef.current.position.copy(position);
-        raccoonRef.current.quaternion.copy(quaternion);
-        raccoonRef.current.scale.set(60, 60, 60); // Match model scale
-        raccoonRef.current.visible = true;
-      }
-    
-      if (glassesRef.current) {
-        glassesRef.current.position.copy(position);
-        glassesRef.current.quaternion.copy(quaternion);
-        glassesRef.current.scale.set(0.3, 0.3, 0.3);
-        glassesRef.current.visible = true;
+      // Adjust the position and scale of models
+      if (modelsRef.current[selectedModel]) {
+        const model = modelsRef.current[selectedModel];
+        model.position.copy(position);
+        model.quaternion.copy(quaternion);
+        model.position.y += 0.05;
+        model.position.z += 0.02;
       }
     };
-    
-    
+
     const processResults = (results) => {
       if (!results || !results.faceLandmarks || !results.faceLandmarks.length) return;
-    
-       let landmarks = results.faceLandmarks[0].map(lm => ({
+
+      let landmarks = results.faceLandmarks[0].map((lm) => ({
         x: lm.x,
         y: lm.y,
         z: lm.z,
       }));
-    
+
       const blendshapes = {};
       for (const category of results.faceBlendshapes[0]?.categories || []) {
         if (category && category.categoryName && category.score !== undefined) {
@@ -143,12 +149,10 @@ const FaceMask = () => {
       }
 
       let matrixData = results.facialTransformationMatrixes[0]?.data;
-      console.log("Matrix frame:", JSON.stringify(matrixData));
       applyMatrixToModels(matrixData);
 
-      [raccoonRef.current, glassesRef.current].forEach((model) => {
-
-        if (model) {
+      Object.values(modelsRef.current).forEach((model) => {
+        if (model && model === modelsRef.current[selectedModel]) {
           model.visible = true;
           model.traverse((obj) => {
             if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences) {
@@ -160,61 +164,56 @@ const FaceMask = () => {
               }
             }
           });
+        } else {
+          model.visible = false;
         }
       });
-      
     };
-    
-    
 
     // Track Face function using video input
     const trackFace = async () => {
-      if (videoRef.current && faceLandmarker) {
-        const results = await faceLandmarker.detectForVideo(
-          videoRef.current, 
-          performance.now());
-        // console.log(results);
-        processResults(results);
+      try {
+        if (videoRef.current && faceLandmarker) {
+          try {
+            const results = await faceLandmarker.detectForVideo(videoRef.current, performance.now());
+            // processResults(results);
+            if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
+              processResults(results);
+            }
+          } catch (error) {
+            console.log('Error in face tracking:', error);
+          }
+
+        }
+        requestAnimationFrame(trackFace);
+      } catch (error) {
+        console.log('Error in face tracking:', error);
       }
-      requestAnimationFrame(trackFace);
+
+
     };
 
     const animate = () => {
-      // model.visible = model === getSelectedModel();
       requestAnimationFrame(animate);
       if (sceneRef.current && camera) {
         renderer.render(sceneRef.current, camera);
       }
     };
-    
-
-    const getSelectedModel = () => {
-      return selectedModel === "raccoon" ? raccoonRef.current : glassesRef.current;
-    };
 
     const setup = async () => {
       initThree();
-      initFaceLandmarker();
+      await initFaceLandmarker();
       loadModels();
       animate();
+
       navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          facingMode: "user" // "user" for front camera, "environment" for back
-        }
-      })
-      navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          facingMode: "user" // "user" for front camera, "environment" for back
-      } }).then((stream) => {
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, facingMode: "user" },
+      }).then((stream) => {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.onplaying = () => {
             trackFace();
-            animate();
+            animate()
           };
         }
       });
@@ -224,6 +223,62 @@ const FaceMask = () => {
 
     return () => {};
   }, [selectedModel]);
+
+  // MQTT Client Setup
+  useEffect(() => {
+    if (mqttClientRef.current) return;
+
+    AWS.config.credentials.get(() => {
+      const { accessKeyId, secretAccessKey, sessionToken } = AWS.config.credentials;
+
+      const url = SigV4Utils.getSignedUrl(
+        AWS_IOT_ENDPOINT,
+        region,
+        accessKeyId,
+        secretAccessKey,
+        sessionToken
+      );
+
+      const client = mqtt.connect(url, { clientId, protocol: 'wss' });
+      mqttClientRef.current = client;
+
+      client.on('connect', () => {
+        console.log('✅ Connected to AWS IoT');
+        client.subscribe('user-requests');
+      });
+
+      client.on('message', (topic, message) => {
+        console.log(`📩 Message on ${topic}:`, message.toString());
+
+        try {
+          const data = JSON.parse(message.toString());
+          if (data.requestType === 'feature-change' && data.event?.feature === 'mask') {
+            const modelName = data.event.featureParam;
+
+            if (modelsRef.current[modelName]) {
+              setSelectedModel(modelName);  // Trigger model change
+            } else {
+              console.warn(`Model "${modelName}" not loaded yet or invalid model name.`);
+            }
+          }
+        } catch (err) {
+          console.error('Error processing MQTT message:', err);
+        }
+      });
+
+      client.on('error', (err) => {
+        console.error('❌ MQTT Error:', err);
+      });
+
+      client.on('close', () => {
+        console.log('🔌 MQTT connection closed');
+      });
+
+      return () => {
+        client.end();
+      };
+    });
+  }, []);
 
   return (
     <>
